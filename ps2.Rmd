@@ -1,0 +1,343 @@
+---
+title: "Problem set 2"
+author: "Yanping Zhu"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+Github link:
+
+```{r setup, include=FALSE}
+library(MatchIt)
+library(plyr)
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(broom)
+library(timereg)
+library(plm)
+library(lfe)
+library(aTSA)
+
+setwd('/Users/yanpingzhu/Desktop/Courses/BUSI 525 Topics in Financial Markets Research/Assignments/Problem set 2')
+```
+# Part 1—No Skilled Funds:
+
+```{r}
+set.seed(2800)
+
+N <- 1000
+T <- 120
+
+#generate market excess return and the error term
+market_ret <- rnorm(n = T, mean = 0.05/12, sd = 0.2/sqrt(12))
+rmkt       <- rep(market_ret, N)
+eps        <- rnorm(n = N * T, mean = 0, sd = 0.1/sqrt(12))
+
+#set id for each fund
+nid <- seq_len(N)
+tid <- seq_len(T)
+tid_temp<- cbind(seq(from=1, to=T, by = 1))
+tid_temp <-cbind(rep(tid_temp, N))
+nid_temp  <-cbind(rep(nid, each=T))
+
+
+
+df_1 <- data.frame(nid = nid_temp, tid = tid_temp, rmkt, eps)
+
+#assuming beta = 1 for all funds and alpha = 0 for all funds, generate the dependent variable 
+
+df_1 <- df_1 %>% 
+  mutate(r= 0 + rmkt + eps)
+head(df_1)
+
+#estimation for each fund
+fit_per_fund <- dlply(df_1, "nid", function(df) lm(r ~ rmkt, data = df))
+
+
+fitted <- ldply(fit_per_fund,tidy) 
+
+#extract the alphas and t-statistics
+fitted_alp <- fitted %>% 
+  filter(term == "(Intercept)") %>% 
+  select(nid = nid, alp_hat=estimate, t_alp_hat = statistic)
+
+
+#extract alpha hats and their t stats
+fitted_beta <- fitted %>% 
+  filter(term == "rmkt") %>% 
+  select(nid = nid, beta_hat=estimate)
+
+#extract beta hats
+ests <- fitted_alp %>% 
+  left_join(fitted_beta, by = "nid")
+
+#obtain the estimated residuals epsilon hats
+df_resi <- df_1 %>% 
+  left_join(ests, by = "nid") %>% 
+  mutate(res = r - alp_hat - beta_hat * rmkt) %>% 
+  #create index for each observation
+  mutate(id = group_indices(.,nid, tid))
+
+#draw a bootstrap sample of 120 months with replacement 
+
+boot <- function(){
+  #bootstrap the time index for each fund
+   tid_boot <- sample(tid, 120, replace = TRUE) 
+   tid_boot <- sort(tid_boot)
+   tid_boot <- rep(tid_boot, N)
+   
+   tid_boot_df <- data.frame(nid = nid_temp, tid = tid_boot)
+   
+  #obtain the bootstrapped data 
+   df_boot <- tid_boot_df %>% 
+     left_join(df_resi %>% select(nid,tid, beta_hat, rmkt, res), by = c("nid","tid"))
+
+ #construct the bootstrap time-series zero-skill excess returns r^b for each fund 
+   df_cons <- df_boot %>% 
+     mutate(nid  = nid,
+            tid  = tid,
+            rmkt = rmkt,
+            rb   = beta_hat * rmkt + res) %>% 
+     select(nid, tid, rmkt, rb)
+
+#estimate the model using the bootstrap time-series
+ fit_boot <- dlply(df_cons, "nid", function(df) lm(rb ~ rmkt, data = df))
+
+
+ fitted_boot <- ldply(fit_boot,tidy) %>% 
+    filter(term == '(Intercept)') %>% 
+    select(nid, estimate, statistic) %>% 
+    rename(alpha_b=estimate, t_b=statistic)
+ 
+ fitted_boot
+}
+
+#produce 100 bootstrapped cross-sections of N t-statistics 
+boot_out <- replicate(n=100, boot(), simplify = FALSE)  
+boot_res <- bind_rows(boot_out, .id = "sample")
+
+
+#generate the plots 
+boot_plot_ave <- boot_res %>% 
+  select(sample,nid,t_b) %>% 
+  group_by(sample) %>% 
+  mutate(rank = rank(t_b)) %>% 
+  ungroup() %>% 
+  group_by(rank) %>% 
+  mutate(average = mean(t_b)) %>% 
+  select(rank, average) %>% 
+  unique()
+
+
+print("Plot of the distribution of the average t-statistics")
+plot(ecdf(boot_plot_ave$average), 
+     main = "Bootstrapped average t-stat", col = 3)
+
+print("Plot of the distribution of atual t-stat")
+plot(ecdf(ests$t_alp_hat),
+     main = "Actual t-stat", col = 3)
+
+
+
+boot_plot_perc5 <- boot_res %>% 
+  select(sample,nid,t_b) %>% 
+  group_by(sample) %>% 
+  mutate(rank = rank(t_b)) %>% 
+  ungroup() %>% 
+  filter(rank == 50) 
+
+print("Plot of the distribution of the 5th percentile")
+plot(ecdf(boot_plot_perc5$t_b),
+     main = "5th percentile t-stat", col = 3)
+
+boot_plot_perc95 <- boot_res %>% 
+  select(sample,nid,t_b) %>% 
+  group_by(sample) %>% 
+  mutate(rank = rank(t_b)) %>% 
+  ungroup() %>% 
+  filter(rank == 950) 
+
+print("Plot of the distributions of the 95th percentile")
+plot(ecdf(boot_plot_perc95$t_b),
+     main = "95th percentile t-stat", col = 3)
+
+```
+
+#Part 2—Some Skilled Funds:
+
+```{r}
+func <- function(lambda, alp){
+
+  #generate alpha for each fund
+  alpha <- c(rep(alp/12, lambda*N), rep(0, (1-lambda)*N))
+  
+  #since alpha does not vary with time
+  alpha <- rep(alpha, each = T)
+  
+  df_2 <- data.frame(nid = nid_temp, tid = tid_temp, alpha, rmkt, eps) %>% 
+  mutate(r= alpha + rmkt + eps)
+  
+  #estimation for each fund
+  fit_per_fund_2<- dlply(df_2, "nid", function(df) lm(r ~ rmkt, data = df))
+
+
+  fitted_2 <- ldply(fit_per_fund_2,tidy) 
+
+  #extract the alphas and t-statistics
+  fitted_2_alp <- fitted_2 %>% 
+    filter(term == "(Intercept)") %>% 
+    select(nid = nid, alp_hat=estimate, t_alp_hat = statistic)
+
+
+  #extract beta hats
+  fitted_2_beta <- fitted_2 %>% 
+    filter(term == "rmkt") %>% 
+    select(nid = nid, beta_hat=estimate)
+
+  ests_2 <- fitted_2_alp %>% 
+    left_join(fitted_2_beta, by = "nid")
+
+  #obtain the estimated residuals epsilon hats
+  df_2_resi <- df_2 %>% 
+    left_join(ests_2, by = "nid") %>% 
+    mutate(res = r - alp_hat - beta_hat * rmkt) %>% 
+    #create index for each observation
+    mutate(id = group_indices(.,nid, tid))
+
+  #draw a bootstrap sample of 120 months with replacement 
+
+  boot_2 <- function(){
+    #bootstrap the time index for each fund
+   tid_boot <- sample(tid, 120, replace = TRUE) 
+   tid_boot <- sort(tid_boot)
+   tid_boot <- rep(tid_boot, N)
+   
+  tid_boot_df <- data.frame(nid = nid_temp, tid = tid_boot)
+   
+  df_2_boot <- tid_boot_df %>% 
+    left_join(df_2_resi %>% select(nid,tid, beta_hat, rmkt, res), by = c("nid","tid"))
+
+ #construct the bootstrap time-series zero-skill excess returns r^b for each fund 
+   df_2_cons <- df_2_boot %>% 
+     mutate(nid  = nid,
+            tid  = tid,
+            rmkt = rmkt,
+            rb   = beta_hat * rmkt + res) %>% 
+     select(nid, tid, rmkt, rb)
+
+#estimate the model using the bootstrap time-series
+   fit_2_boot <- dlply(df_2_cons, "nid", function(df) lm(rb ~ 1+rmkt, data = df))
+
+
+   fitted_2_boot <- ldply(fit_2_boot,tidy) %>% 
+      filter(term == '(Intercept)') %>% 
+      select(nid, estimate, statistic) %>% 
+      rename(alpha_b=estimate, t_b=statistic)
+ 
+   fitted_2_boot
+}
+
+#produce 100 bootstrapped cross-sections of N t-statistics 
+boot_out_2 <- replicate(n=100, boot_2(), simplify = FALSE)  
+boot_res_2 <- bind_rows(boot_out_2, .id = "sample")
+
+
+#generate the plots 
+boot_plot_ave_2 <- boot_res_2 %>% 
+  select(sample,nid,t_b) %>% 
+  group_by(sample) %>% 
+  mutate(rank = rank(t_b)) %>% 
+  ungroup() %>% 
+  group_by(rank) %>% 
+  mutate(average = mean(t_b)) %>% 
+  select(rank, average) %>% 
+  unique()
+
+
+print("Plot of the distributions of the average t-statistics")
+plot(ecdf(boot_plot_ave_2$average), 
+     main = "Bootstrapped average t-stat", col = 3)
+
+print("Plot of the distribution of atual t-stat")
+plot(ecdf(ests_2$t_alp_hat),
+     main = "Actual t-stat", col = 3)
+
+
+
+
+boot_plot_perc5_2 <- boot_res_2 %>% 
+  select(sample,nid,t_b) %>% 
+  group_by(sample) %>% 
+  mutate(rank = rank(t_b)) %>% 
+  ungroup() %>% 
+  filter(rank == 50) 
+
+print("Plot of the distributions of the 5th percentile")
+plot(ecdf(boot_plot_perc5_2$t_b), 
+     main = "Bootstrapped 5th percentile t-stat", col = 3)
+
+boot_plot_perc95_2 <- boot_res_2 %>% 
+  select(sample,nid,t_b) %>% 
+  group_by(sample) %>% 
+  mutate(rank = rank(t_b)) %>% 
+  ungroup() %>% 
+  filter(rank == 950) 
+
+
+print("Plot of the distributions of the 95th percentile")
+plot(ecdf(boot_plot_perc95_2$t_b), 
+     main = "Bootstrapped 95th percentile t-stat", col = 3) 
+  
+}
+```
+
+For $\lambda = 0.1$:
+```{r}
+
+
+func(0.1,0.01)
+
+func(0.1,0.025)
+
+func(0.1, 0.05)
+
+```
+
+For $\lambda = 0.25$:
+```{r}
+
+
+func(0.25,0.01)
+
+func(0.25,0.025)
+
+func(0.25, 0.05)
+
+```
+
+For $\lambda = 0.5$:
+```{r}
+
+
+func(0.5,0.01)
+
+func(0.5,0.025)
+
+func(0.5, 0.05)
+
+```
+
+For $\lambda = 0.75$:
+```{r}
+
+
+func(0.75,0.01)
+
+func(0.75,0.025)
+
+func(0.75, 0.05)
+
+```
